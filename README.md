@@ -25,3 +25,4 @@ To add a new problem, create a new folder in the `problems/glory` directory wher
 
 
 
+# Shlok-amd-distributed
