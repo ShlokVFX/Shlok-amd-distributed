@@ -1,3 +1,6 @@
+#!POPCORN leaderboard amd-all2all
+#!POPCORN gpus MI300x8
+
 import torch
 import torch.distributed as dist
 from task import input_t, output_t
