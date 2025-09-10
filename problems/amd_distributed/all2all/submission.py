@@ -5,7 +5,6 @@ import torch
 import torch.distributed as dist
 from task import input_t, output_t
 
-
 # ---------------- All2All pytorch impl ----------------
 class PyTorchAllToAll:
     META_DIM = 5  # global_exp, src_rank, src_token, src_k, pad

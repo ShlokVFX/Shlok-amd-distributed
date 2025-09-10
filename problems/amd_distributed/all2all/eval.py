@@ -111,14 +111,23 @@ def calculate_stats(durations: list[int]):
     @return: A Stats object containing the number of runs, mean, standard deviation, error, best, and worst durations.
     """
     runs = len(durations)
+    if runs == 0:
+        return Stats(runs=0, mean=0.0, std=0.0, err=0.0, best=0.0, worst=0.0)
+    
     total = sum(durations)
     best = min(durations)
     worst = max(durations)
 
     avg = total / runs
     variance = sum(map(lambda x: (x - avg) ** 2, durations))
-    std = math.sqrt(variance / (runs - 1))
-    err = std / math.sqrt(runs)
+    # For a single run, standard deviation is 0
+    if runs > 1:
+        std = math.sqrt(variance / (runs - 1))
+        err = std / math.sqrt(runs)
+    else:
+        std = 0.0
+        err = 0.0
+
 
     return Stats(runs=runs, mean=avg, std=std, err=err, best=float(best),
                  worst=float(worst))
@@ -524,22 +533,126 @@ def run_profiling(logger: PopcornOutput, tests: list[TestCase]):
     return 0
 
 
+# ##################################################################
+# ## START: New function added for pretty-printing benchmark results
+# ##################################################################
+def format_pretty_results(results: list[dict]):
+    """
+    Formats benchmark results into a human-readable string and prints to stdout.
+
+    Args:
+        results: A list of dictionaries, each containing 'spec_args' (dict) and 'stats' (Stats object).
+    """
+    output_lines = []
+    # Define the desired order for spec keys to match the requested output
+    spec_order = ['seed', 'hidden_dim', 'world_size', 'num_experts', 'max_num_tokens', 'experts_per_token']
+
+    for result in results:
+        spec_args = result['spec_args']
+        stats = result['stats']
+
+        # Re-order the spec string based on the preferred order
+        spec_items = [f"{key}: {spec_args[key]}" for key in spec_order if key in spec_args]
+        # Add any other keys that might be present but not in the preferred order
+        for key, val in spec_args.items():
+            if key not in spec_order:
+                spec_items.append(f"{key}: {val}")
+        spec_line = "; ".join(spec_items)
+
+        # Convert nanoseconds from the Stats object to milliseconds for display
+        ns_to_ms = 1_000_000.0
+        mean_ms = stats.mean / ns_to_ms
+        err_ms = stats.err / ns_to_ms
+        best_ms = stats.best / ns_to_ms
+        worst_ms = stats.worst / ns_to_ms
+
+        # Format the performance lines with emojis and correct precision
+        stats_line = f" ⏱ {mean_ms:.2f} ± {err_ms:.3f} ms"
+        range_line = f" ⚡ {best_ms:.2f} ms 🐌 {worst_ms:.2f} ms"
+
+        output_lines.append(f"{spec_line}\n{stats_line}\n{range_line}")
+
+    # Print the final formatted string to standard output
+    print("\n\n".join(output_lines))
+# ################################################################
+# ## END: New function
+# ################################################################
+
+
 def main():
     fd = os.getenv("POPCORN_FD")
-    if not fd:
+    # If not running in the Popcorn environment, allow 'pretty' mode to run without a file descriptor
+    if not fd and "pretty" not in sys.argv:
+        print("Error: POPCORN_FD environment variable not set.", file=sys.stderr)
         return 111
 
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
+        print("Usage: python eval.py [mode] [test_file]", file=sys.stderr)
         return 2
 
     mode = sys.argv[1]
+    
+    # Allow 'pretty' mode to run without a test file for demonstration, but it's recommended
+    if len(sys.argv) < 3 and mode != "pretty":
+        print("Usage: python eval.py [mode] [test_file]", file=sys.stderr)
+        return 2
+    
+    test_file = sys.argv[2] if len(sys.argv) > 2 else ""
+
     seed = os.getenv("POPCORN_SEED")
-    os.unsetenv("POPCORN_SEED")
+    if seed:
+        os.unsetenv("POPCORN_SEED")
     n_gpus = int(os.getenv("POPCORN_GPUS", "1"))
     seed = int(seed) if seed else None
     set_seed(seed or 42)
-    tests = get_test_cases(sys.argv[2], seed)
+    
+    if not test_file:
+        if mode == "pretty":
+            print("Warning: No test file provided. Cannot run benchmarks.", file=sys.stderr)
+            return 0 # Exit gracefully
+        else:
+            print("Error: Test file not provided.", file=sys.stderr)
+            return 2
 
+    tests = get_test_cases(test_file, seed)
+    if not tests:
+        print("No test cases found.", file=sys.stderr)
+        return 0
+
+    # The 'pretty' mode does not use the PopcornOutput logger and prints to stdout
+    if mode == "pretty":
+        import multiprocessing
+        mp_context = multiprocessing.get_context('spawn')
+        with mp_context.Pool(n_gpus) as pool:
+            # ################################################################
+            # ## START: New "pretty" mode logic
+            # ################################################################
+            # This mode runs benchmarks and prints a human-readable summary to stdout
+            print(f"Running {len(tests)} benchmarks for pretty printing...", file=sys.stderr)
+            # warm up
+            run_single_benchmark(pool, tests[0], False, 100, 10e7)
+
+            results = []
+            all_passed = True
+            for idx, test in enumerate(tests):
+                # Use a copy of the test case to avoid modifying the original's seed
+                test_copy = copy.deepcopy(test)
+                result = run_single_benchmark(pool, test_copy, False, 100, 10e9)
+                if isinstance(result, Stats):
+                    results.append({'spec_args': test.args, 'stats': result})
+                else:
+                    all_passed = False
+                    print(f"\n--- Benchmark FAILED for spec: {test.spec} ---", file=sys.stderr)
+                    print(f"Error: {result}", file=sys.stderr)
+            
+            print("\n--- Benchmark Results ---", file=sys.stderr)
+            format_pretty_results(results)
+            return 0 if all_passed else 112
+            # ################################################################
+            # ## END: New "pretty" mode logic
+            # ################################################################
+
+    # Original modes that use the Popcorn logger
     with PopcornOutput(int(fd)) as logger:
         import multiprocessing
         mp_context = multiprocessing.get_context('spawn')
@@ -563,7 +676,7 @@ def main():
                     else:
                         passed = False
                         logger.log(f"benchmark.{i}.status", "fail")
-                        logger.log(f"benchmark.{i}.error", str(result))  # TODO: Make sure result implements __str__?
+                        logger.log(f"benchmark.{i}.error", str(result))
                         break
 
                 logger.log("check", "pass" if passed else "fail")
@@ -571,6 +684,7 @@ def main():
                 run_profiling(logger, tests)
             else:
                 # invalid mode
+                print(f"Error: Invalid mode '{mode}'", file=sys.stderr)
                 return 2
 
 
